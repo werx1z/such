@@ -1,0 +1,30 @@
+name: Build dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build libstandarling.dylib
+        run: |
+          mkdir -p build
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 -miphoneos-version-min=14.0 \
+            -std=c++17 -fobjc-arc -O2 -Wno-deprecated-declarations \
+            -dynamiclib -x objective-c++ Tweak.mm \
+            -framework Foundation -framework UIKit -framework AVFoundation -framework QuartzCore -framework CoreGraphics \
+            -install_name @executable_path/Frameworks/libstandarling.dylib \
+            -o build/libstandarling.dylib
+          otool -L build/libstandarling.dylib
+          ls -lh build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libstandarling
+          path: build/libstandarling.dylib
