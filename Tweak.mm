@@ -223,10 +223,25 @@ inline bool W2SRaw(uintptr_t cam, Vec3 w, Vec3& r) {
 }
 
 // ---- локальный игрок и камера ----
+// Последний тик PlayerController.Update (ставит хук). Нет свежих тиков = лобби/загрузка, мира ещё нет.
+inline double lastPC = 0;
+inline bool InMatch() { return CACurrentMediaTime() - lastPC < 1.0; }
+
+// GetInstance - managed-метод: если инстанса нет, il2cpp кидает C++ исключение (NullReference).
+// Раньше его никто не ловил -> terminate -> abort. Теперь: ловим и не дёргаем метод 1 секунду.
 inline uintptr_t PMC() {
     if (!base) return 0;
+    static double retryAt = 0;
+    double now = CACurrentMediaTime();
+    if (now < retryAt) return 0;
     using Fn = uintptr_t (*)();
-    return ((Fn)(base + OFF::RVA_PMC_GetInstance))();
+    try {
+        uintptr_t p = ((Fn)(base + OFF::RVA_PMC_GetInstance))();
+        return Valid(p) ? p : 0;
+    } catch (...) {
+        retryAt = now + 1.0;
+        return 0;
+    }
 }
 inline uintptr_t LocalPlayer() { uintptr_t p = PMC(); return Valid(p) ? Ptr(p + OFF::PMC_Player) : 0; }
 inline uintptr_t UnityCamera() { uintptr_t p = PMC(); return Valid(p) ? Ptr(p + OFF::PMC_Camera) : 0; }
@@ -235,8 +250,12 @@ inline uint8_t TeamOf(uintptr_t pc) { return Rd<uint8_t>(pc + OFF::PC_Team); }  
 inline uintptr_t BoneT(uintptr_t pc, int i) { return Ptr(Ptr(pc + OFF::PC_Biped) + 0x18 + 8 * i); }
 
 // Aspect / Fog / Sky: применяем каждый кадр, при выключении один раз возвращаем
+inline void ApplyWorldImpl();
 inline void ApplyWorld() {
-    if (!inited) return;
+    if (!inited || !InMatch()) return;      // в лобби камеры/мира нет
+    try { ApplyWorldImpl(); } catch (...) {}  // icall'ы Camera/RenderSettings тоже кидают, если камера уже уничтожена
+}
+inline void ApplyWorldImpl() {
     static bool wasA = false, wasF = false, wasS = false;
     uintptr_t cam = UnityCamera();
     bool a = [Cfg b:@"aspect"], s = [Cfg b:@"sky"], f = [Cfg b:@"fog"];
@@ -284,6 +303,7 @@ struct EP {
 
 static bool BuildPlayers(std::vector<EP>& out, CGSize vs) {
     out.clear();
+    if (!G::InMatch()) return false;
     uintptr_t pmc = G::PMC(); if (!G::Valid(pmc)) return false;
     uintptr_t cam = G::Ptr(pmc + OFF::PMC_Camera), local = G::Ptr(pmc + OFF::PMC_Player);
     if (!G::Valid(cam) || !G::i_sw || !G::i_sh) return false;
@@ -452,7 +472,8 @@ static void SetG(CAGradientLayer* g, NSString* key, CGRect fr, CGSize vs) {
         _log.string = [ls componentsJoinedByString:@"\n"]; _log.hidden = NO;
     } else _log.hidden = YES;
     // --- ESP ---
-    std::vector<EP> ps; bool ok = [Cfg b:@"esp"] && BuildPlayers(ps, vs);
+    std::vector<EP> ps; bool ok = false;
+    if ([Cfg b:@"esp"]) { try { ok = BuildPlayers(ps, vs); } catch (...) { ok = false; ps.clear(); } }
     bool dbg = [Cfg b:@"debug"];
     _stat.hidden = !dbg;
     if (dbg) { _stat.string = [NSString stringWithFormat:@"%s | players:%d", G::status, (int)ps.size()]; _stat.frame = CGRectMake(12, vs.height - 20, vs.width - 24, 14); }
@@ -967,6 +988,7 @@ typedef void (*fn_adpg_t)(void*, void*, void*, void*);
 static void h_PCUpdate(void* self, void* mi) {
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
     PS::seen[(uintptr_t)self] = CACurrentMediaTime();
+    G::lastPC = CACurrentMediaTime();
     TickLocal((uintptr_t)self);
 }
 // Попадание по игроку (this = PlayerHitController жертвы). pp = PhotonPlayer, предположительно стрелок (?)
