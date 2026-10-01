@@ -893,14 +893,37 @@ static void* FindImage(const char* sub) {
     }
     return NULL;
 }
-// Имена классов в дампе обфусцированы, но namespace мы не знаем - ищем по имени во всём образе.
-static void* FindClass(void* img, const char* name) {
-    uint32_t cnt = il_image_get_class_count(img);
-    for (uint32_t i = 0; i < cnt; i++) {
-        void* k = il_image_get_class(img, i); const char* nm = k ? il_class_get_name(k) : NULL;
-        if (nm && !strcmp(nm, name)) return k;
+// Ищем класс по имени во ВСЕХ сборках (раньше брали первую сборку с "Assembly-CSharp" в имени -
+// это мог быть Assembly-CSharp-firstpass, где игровых классов нет).
+static void* FindClass(void* /*img*/, const char* name) {
+    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
+    for (size_t j = 0; j < n; j++) {
+        void* img = il_assembly_get_image(as[j]); if (!img) continue;
+        uint32_t cnt = il_image_get_class_count(img);
+        for (uint32_t i = 0; i < cnt; i++) {
+            void* k = il_image_get_class(img, i); const char* nm = k ? il_class_get_name(k) : NULL;
+            if (nm && !strcmp(nm, name)) return k;
+        }
     }
     return NULL;
+}
+// Диагностика: какие сборки есть, сколько в них классов, и какие классы похожи на нужные
+static void DumpDiag() {
+    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
+    Log([NSString stringWithFormat:@"assemblies: %zu", n]);
+    int shown = 0;
+    for (size_t j = 0; j < n; j++) {
+        void* img = il_assembly_get_image(as[j]); if (!img) continue;
+        uint32_t cnt = il_image_get_class_count(img);
+        const char* in = il_image_get_name(img);
+        if (cnt > 200 || (in && strstr(in, "Assembly"))) Log([NSString stringWithFormat:@"  %s: %u классов", in ? in : "?", cnt]);
+        for (uint32_t i = 0; i < cnt && shown < 40; i++) {
+            void* k = il_image_get_class(img, i); const char* nm = k ? il_class_get_name(k) : NULL;
+            if (nm && (strstr(nm, "Player") || strstr(nm, "Weapon") || strstr(nm, "Gun") || strstr(nm, "Hit")) && in && !strstr(in, "UnityEngine") && !strstr(in, "Photon")) {
+                Log([NSString stringWithFormat:@"  class %s (%s)", nm, in]); shown++;
+            }
+        }
+    }
 }
 
 // ---------- реестр оригиналов ----------
@@ -1047,6 +1070,7 @@ static void TryInstall() {
     G::Init();
     void* img = (G::base && il_domain_get && il_class_get_name) ? FindImage("Assembly-CSharp") : NULL;
     if (!img) { if (g_attempt == 1) Log(@"il2cpp API / Assembly-CSharp не найдены, повторю"); goto again; }
+    if (g_attempt == 1 || g_attempt == 6) DumpDiag();
     {
         int left = 0;
         for (int i = 0; i < kHooks; i++) {
