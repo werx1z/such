@@ -926,67 +926,6 @@ static void DumpDiag() {
     }
 }
 
-// ---------- ДИАГНОСТИКА: дамп классов/методов с RVA (замена dump.cs) ----------
-// Пишет Documents/sw_dump.txt: "== сборка", "class NS.Имя", "  Метод(argc) rva=0x..."
-static void SafeName(FILE* f, const char* s) {   // обфусцированные имена могут быть не-UTF8
-    if (!s) { fputs("?", f); return; }
-    for (const unsigned char* c = (const unsigned char*)s; *c; c++) {
-        if (*c >= 0x20 && *c < 0x7F) fputc(*c, f); else fprintf(f, "\\x%02X", *c);
-    }
-}
-static void DumpAllToFile() {
-    void* h = dlopen(NULL, RTLD_NOW);
-    auto cns   = (const char* (*)(void*))dlsym(h, "il2cpp_class_get_namespace");
-    auto cmeth = (void* (*)(void*, void**))dlsym(h, "il2cpp_class_get_methods");
-    auto mname = (const char* (*)(void*))dlsym(h, "il2cpp_method_get_name");
-    auto mpc   = (uint32_t (*)(void*))dlsym(h, "il2cpp_method_get_param_count");
-    if (!cns) { Log(@"dump: il2cpp_class_get_namespace not found"); return; }
-    FILE* f = fopen([DocPath(@"sw_dump.txt") fileSystemRepresentation], "w");
-    if (!f) { Log(@"dump: cannot open sw_dump.txt"); return; }
-    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
-    int classes = 0;
-    for (size_t j = 0; j < n; j++) {
-        void* img = il_assembly_get_image(as[j]); if (!img) continue;
-        const char* in = il_image_get_name(img);
-        if (!in || strstr(in, "UnityEngine") || strstr(in, "System") || strstr(in, "mscorlib") || strstr(in, "Photon") || strstr(in, "Newtonsoft")) continue;
-        uint32_t cnt = il_image_get_class_count(img);
-        fprintf(f, "== %s (%u)\n", in, cnt);
-        for (uint32_t i = 0; i < cnt; i++) {
-            void* k = il_image_get_class(img, i); if (!k) continue;
-            fputs("class ", f); SafeName(f, cns(k)); fputc('.', f); SafeName(f, il_class_get_name(k)); fputc('\n', f); classes++;
-            if (cmeth && mname) {
-                void* it = NULL; void* m;
-                while ((m = cmeth(k, &it))) {
-                    uintptr_t fp = *(uintptr_t*)m;
-                    fputs("  ", f); SafeName(f, mname(m));
-                    fprintf(f, "(%u) rva=0x%lX\n", mpc ? mpc(m) : 0, fp ? (unsigned long)(fp - G::base) : 0UL);
-                }
-            }
-        }
-    }
-    fclose(f);
-    Log([NSString stringWithFormat:@"dump: %d классов -> Documents/sw_dump.txt", classes]);
-}
-// Поиск классов по методам с читаемыми именами (имена классов могли поменяться)
-static void ProbeByMethod() {
-    struct { const char* m; int argc; } want[] = { {"HitViaServer", 5}, {"DieViaServer", 0} };
-    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
-    for (size_t j = 0; j < n; j++) {
-        void* img = il_assembly_get_image(as[j]); if (!img) continue;
-        const char* in = il_image_get_name(img);
-        if (!in || strstr(in, "UnityEngine") || strstr(in, "Photon")) continue;
-        uint32_t cnt = il_image_get_class_count(img);
-        for (uint32_t i = 0; i < cnt; i++) {
-            void* k = il_image_get_class(img, i); if (!k) continue;
-            for (auto& w : want) {
-                void* mi = il_class_get_method(k, w.m, w.argc);
-                if (mi) Log([NSString stringWithFormat:@"probe: %s.%s argc=%d rva=0x%lX (%s)",
-                    il_class_get_name(k), w.m, w.argc, (unsigned long)(*(uintptr_t*)mi - G::base), in]);
-            }
-        }
-    }
-}
-
 // ---------- реестр оригиналов ----------
 struct OrigE { void* mi; void* fn; };
 static OrigE g_orig[64]; static int g_nOrig;
@@ -1131,10 +1070,6 @@ static void TryInstall() {
     G::Init();
     void* img = (G::base && il_domain_get && il_class_get_name) ? FindImage("Assembly-CSharp") : NULL;
     if (!img) { if (g_attempt == 1) Log(@"il2cpp API / Assembly-CSharp не найдены, повторю"); goto again; }
-    if (g_attempt == 1) {
-        Log([NSString stringWithFormat:@"build: %s %s base=0x%lX", __DATE__, __TIME__, (unsigned long)G::base]);
-        ProbeByMethod(); DumpAllToFile();
-    }
     if (g_attempt == 1 || g_attempt == 6) DumpDiag();
     {
         int left = 0;
@@ -1160,6 +1095,7 @@ again:
 
 __attribute__((constructor)) static void Entry() {
     LoadSkip();
+    Log([NSString stringWithFormat:@"=== build %s %s (v3: FindClass по всем сборкам, DumpDiag) ===", __DATE__, __TIME__]);
     MenuInit();   // само откладывает показ окна на 5 секунд
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
 }
