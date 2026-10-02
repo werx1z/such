@@ -121,6 +121,8 @@ namespace OFF {
     constexpr uintptr_t RVA_WeaponId = 0x1918F58;                                    // (?) WeaponController.NGBBPDDCMAC -> DFBFMIHOHPG
     constexpr uintptr_t HC_Player = 0x78;                                            // HitController -> PlayerController (жертва)
     constexpr uintptr_t MC_Input = 0x70, MC_CharCtrl = 0x80;                         // MovementController
+    constexpr uintptr_t PC_Aim = 0x50, AC_Fps = 0x70, AC_Cam = 0x80, AC_AimData = 0x90;   // PlayerController -> AimController: FPSCamera/camTransform/aimingData
+    constexpr uintptr_t WPN_Owner = 0x18;                                            // WeaponController -> PlayerController
     constexpr uintptr_t MI_Move = 0x10, MI_Jump = 0x24;                              // (?) MLGFJPPLONI: вектор движения, флаг прыжка
     constexpr uintptr_t RVA_MC_Speed = 0x1AAA3DC;                                    // (?) MovementController.AJDCAMCKEMB(float)
 }
@@ -177,6 +179,8 @@ inline void (*i_fogMode)(int) = nullptr;
 inline void (*i_fogStart)(float) = nullptr;
 inline void (*i_fogEnd)(float) = nullptr;
 inline bool (*i_grounded)(void*) = nullptr;
+inline void (*i_getRot)(void*, float*) = nullptr;   // Transform.rotation (x,y,z,w)
+inline void (*i_setRot)(void*, float*) = nullptr;
 
 inline void InitUnity() {
     if (inited) return;
@@ -199,6 +203,9 @@ inline void InitUnity() {
     i_fogStart    = (decltype(i_fogStart))IC({"UnityEngine.RenderSettings::set_fogStartDistance"});
     i_fogEnd      = (decltype(i_fogEnd))IC({"UnityEngine.RenderSettings::set_fogEndDistance"});
     i_grounded    = (decltype(i_grounded))IC({"UnityEngine.CharacterController::get_isGrounded"});
+    i_getRot = (decltype(i_getRot))IC({"UnityEngine.Transform::get_rotation_Injected", "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)", "UnityEngine.Transform::INTERNAL_get_rotation"});
+    i_setRot = (decltype(i_setRot))IC({"UnityEngine.Transform::set_rotation_Injected", "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)", "UnityEngine.Transform::INTERNAL_set_rotation"});
+    Log([NSString stringWithFormat:@"icall: rot get=%d set=%d", i_getRot != 0, i_setRot != 0]);
     Log([NSString stringWithFormat:@"icall: pos=%s w2s=%s screen=%d aspect=%d fog=%d sky=%d grounded=%d", a ? a : "NO", b ? b : "NO",
          i_sw && i_sh, i_setAspect != 0, i_fog && i_fogCol, i_setClear && i_setBg, i_grounded != 0]);
     if (!(i_posInj || i_posRet) || !(i_w2sInj || i_w2sRet) || !i_sw || !i_sh) {
@@ -928,8 +935,8 @@ static void DumpDiag() {
 
 // ---------- реестр оригиналов ----------
 struct OrigE { void* mi; void* fn; };
-static OrigE g_orig[64]; static int g_nOrig;
-static void  regOrig(void* mi, void* fn) { if (g_nOrig < 64) g_orig[g_nOrig++] = { mi, fn }; }
+static OrigE g_orig[96]; static int g_nOrig;
+static void  regOrig(void* mi, void* fn) { if (g_nOrig < 96) g_orig[g_nOrig++] = { mi, fn }; }
 static void* origOf(void* mi) { for (int i = 0; i < g_nOrig; i++) if (g_orig[i].mi == mi) return g_orig[i].fn; return NULL; }
 
 // ---------- защита от краша: если упали на патче, при следующем запуске он пропускается ----------
@@ -1029,6 +1036,7 @@ static void h_ADPG(void* self, void* hit, void* pp, void* mi) {
     }
     if ([Cfg b:@"probe"]) Log([NSString stringWithFormat:@"probe: ADPG mine=%d victim=%p n=%d", mine, (void*)victim, n]);
     if (!mine) return;
+    if ([Cfg b:@"silent"] || [Cfg b:@"silent360"]) Log([NSString stringWithFormat:@"SILENT: моё попадание registered, victim=%p", (void*)victim]);
     PS::lastVictim = victim; PS::lastHitT = CACurrentMediaTime();
     NSString* nm = G::Str(G::Ptr(G::Ptr(victim + OFF::PC_PhotonPlayer) + OFF::PP_Nick));
     EvHit(nm.length ? nm : @"?", [NSString stringWithFormat:@"[%s] %.0f", WeaponName(wid), first]);
@@ -1041,6 +1049,114 @@ static void h_Die(void* self, void* mi) {
 }
 
 
+
+// ===== Silent Aim =====
+// Все хуки тут data-only (MethodInfo / vtable): inline-хук на устройстве без JIT не поставить.
+// Выстрел считается внутри ПРИВАТНЫХ методов GunController (прямые вызовы, подменить нельзя),
+// но запускается из ВИРТУАЛЬНЫХ методов того же класса (их vtable-запись патчится).
+// Принцип как в чите для другой игры (направление правится в момент выстрела): на время такого вызова
+// поворачиваем камеру/прицел на цель, после вызова возвращаем -> на экране ничего не дёргается.
+namespace SA {
+struct Quat4 { float x, y, z, w; };
+inline Quat4 LookQ(Vec3 f) {          // эквивалент Quaternion.LookRotation(f, up)
+    float l = sqrtf(f.x*f.x + f.y*f.y + f.z*f.z); if (l < 1e-6f) return {0, 0, 0, 1};
+    f.x /= l; f.y /= l; f.z /= l;
+    Vec3 r = { f.z, 0.f, -f.x };      // cross(up, f)
+    float rl = sqrtf(r.x*r.x + r.z*r.z);
+    if (rl < 1e-5f) r = { 1.f, 0.f, 0.f }; else { r.x /= rl; r.z /= rl; }
+    Vec3 u = { f.y*r.z - f.z*r.y, f.z*r.x - f.x*r.z, f.x*r.y - f.y*r.x };   // cross(f, r)
+    float m00 = r.x, m01 = u.x, m02 = f.x, m10 = r.y, m11 = u.y, m12 = f.y, m20 = r.z, m21 = u.z, m22 = f.z;
+    float tr = m00 + m11 + m22; Quat4 q;
+    if (tr > 0)                       { float s = sqrtf(tr + 1.f) * 2.f;               q = { (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s }; }
+    else if (m00 > m11 && m00 > m22)  { float s = sqrtf(1.f + m00 - m11 - m22) * 2.f; q = { 0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s }; }
+    else if (m11 > m22)               { float s = sqrtf(1.f + m11 - m00 - m22) * 2.f; q = { (m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s }; }
+    else                              { float s = sqrtf(1.f + m22 - m00 - m11) * 2.f; q = { (m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s }; }
+    return q;
+}
+
+struct Tgt { bool ok = false; Vec3 aim{0,0,0}; Vec3 cam{0,0,0}; uintptr_t pc = 0; float score = 0; };
+
+// Цель: враг, жив. Обычный режим - ближайший к центру экрана в пределах FOV, 360 - ближайший по расстоянию.
+inline Tgt Pick() {
+    Tgt t;
+    if (!G::InMatch() || !G::i_sw || !G::i_sh) return t;
+    uintptr_t pmc = G::PMC(); if (!G::Valid(pmc)) return t;
+    uintptr_t cam = G::Ptr(pmc + OFF::PMC_Camera), local = G::LocalPlayer();
+    if (!G::Valid(cam) || !G::Valid(local)) return t;
+    G::Pos(G::Ptr(pmc + OFF::PMC_Transform), t.cam);
+    bool all = [Cfg b:@"silent360"], swapHp = [Cfg b:@"hpswap"];
+    uint8_t lteam = G::TeamOf(local);
+    float sw = (float)G::i_sw(), sh = (float)G::i_sh(); if (sw < 1 || sh < 1) return t;
+    float fov = [Cfg f:@"silent.fov"]; if (fov < 1) fov = 1;
+    float fovPx = (sh * 0.5f) * tanf(fov * 0.0174533f) / 0.41421f;   // вертикальный FOV камеры = 45 градусов
+    if (fovPx > 1e5f) fovPx = 1e5f;
+    float best = 1e30f; double now = CACurrentMediaTime();
+    for (auto& kv : PS::seen) {
+        if (now - kv.second > 0.5) continue;
+        uintptr_t pc = kv.first; if (pc == local) continue;
+        uint8_t tm = G::TeamOf(pc); if (tm != 1 && tm != 2) continue;
+        if (lteam != 0 && tm == lteam) continue;
+        if (G::Rd<int>(pc + (swapHp ? OFF::PC_HpB : OFF::PC_HpA)) <= 0) continue;
+        uintptr_t biped = G::Ptr(pc + OFF::PC_Biped); if (!G::Valid(biped)) continue;
+        Vec3 w; if (!G::Pos(G::Ptr(biped + 0x18), w)) continue;      // 0x18 = Head
+        float score;
+        if (all) { float dx = w.x - t.cam.x, dy = w.y - t.cam.y, dz = w.z - t.cam.z; score = dx*dx + dy*dy + dz*dz; }
+        else {
+            Vec3 r; if (!G::W2SRaw(cam, w, r) || r.z <= 0.01f) continue;
+            float dx = r.x - sw * 0.5f, dy = r.y - sh * 0.5f; score = sqrtf(dx*dx + dy*dy);
+            if (score > fovPx) continue;
+        }
+        if (score < best) { best = score; t.ok = true; t.aim = w; t.pc = pc; t.score = score; }
+    }
+    return t;
+}
+
+// RAII: на время вызова оригинала камера/прицел смотрят на цель; деструктор всё возвращает (даже при исключении il2cpp)
+struct Scope {
+    struct Saved { uintptr_t t; Quat4 q; };
+    Saved s[3]; int n = 0;
+    Scope(uintptr_t gun, const char* tag) {
+        try {
+            if (![Cfg b:@"silent"] && ![Cfg b:@"silent360"]) return;
+            if (!G::i_getRot || !G::i_setRot) { static bool w; if (!w) { w = true; Log(@"silent: нет icall get/set_rotation (см. 'icall: rot' выше)"); } return; }
+            uintptr_t local = G::LocalPlayer();
+            if (!G::Valid(local) || G::Ptr(gun + OFF::WPN_Owner) != local) return;   // только оружие самого игрока
+            Tgt tg = Pick(); if (!tg.ok) return;
+            Vec3 d = { tg.aim.x - tg.cam.x, tg.aim.y - tg.cam.y, tg.aim.z - tg.cam.z };
+            Quat4 q = LookQ(d);
+            uintptr_t aim = G::Ptr(local + OFF::PC_Aim), pmc = G::PMC();
+            uintptr_t c[3] = { G::Valid(aim) ? G::Ptr(aim + OFF::AC_Cam) : 0, G::Valid(aim) ? G::Ptr(aim + OFF::AC_Fps) : 0,
+                               G::Valid(pmc) ? G::Ptr(pmc + OFF::PMC_Transform) : 0 };
+            static int logn = 0;
+            for (uintptr_t tr : c) {
+                if (!G::Valid(tr)) continue;
+                bool dup = false; for (int i = 0; i < n; i++) if (s[i].t == tr) dup = true;
+                if (dup) continue;
+                Quat4 cur; G::i_getRot((void*)tr, (float*)&cur);
+                s[n].t = tr; s[n].q = cur; n++;
+                if (logn < 8) {   // диагностика: сверка углов камеры с aimingData (для запасного варианта через углы)
+                    float fx = 2*(cur.x*cur.z + cur.w*cur.y), fy = 2*(cur.y*cur.z - cur.w*cur.x), fz = 1 - 2*(cur.x*cur.x + cur.y*cur.y);
+                    uintptr_t ad = G::Valid(aim) ? G::Ptr(aim + OFF::AC_AimData) : 0;
+                    Log([NSString stringWithFormat:@"silentdiag[%s] tr=%p yaw=%.1f pitch=%.1f | aimingData f0=%.3f f1=%.3f", tag, (void*)tr,
+                         atan2f(fx, fz) * 57.29578f, -asinf(fy) * 57.29578f, ad ? G::Rd<float>(ad + 0x10) : 0.f, ad ? G::Rd<float>(ad + 0x14) : 0.f]);
+                }
+                G::i_setRot((void*)tr, (float*)&q);
+            }
+            if (logn < 8) { logn++; Log([NSString stringWithFormat:@"silent[%s]: цель pc=%p, поворотов=%d", tag, (void*)tg.pc, n]); }
+        } catch (...) {}
+    }
+    ~Scope() { try { for (int i = n - 1; i >= 0; i--) G::i_setRot((void*)s[i].t, (float*)&s[i].q); } catch (...) {} }
+};
+}   // namespace SA
+
+typedef void (*fn_gv0_t)(void*, void*);
+typedef void (*fn_gtick_t)(void*, float, void*);
+typedef void (*fn_gin_t)(void*, void*, float, float, void*);
+// Виртуальные методы GunController, из которых может запускаться выстрел (какой именно - покажет log.txt: строки silent[...])
+static void h_GunV0(void* self, void* mi)  { fn_gv0_t o = (fn_gv0_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "v0"); o(self, mi); }
+static void h_GunTick(void* self, float dt, void* mi) { fn_gtick_t o = (fn_gtick_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "tick"); o(self, dt, mi); }
+static void h_GunInput(void* self, void* in, float t, float dt, void* mi) { fn_gin_t o = (fn_gin_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "input"); o(self, in, t, dt, mi); }
+
 // ---------- таблица патчей ----------
 struct HookDef { const char* tag; const char* cls; const char* meth; int argc; uintptr_t rva; bool vt; void* rep; bool done; };
 static HookDef g_hooks[] = {
@@ -1052,6 +1168,10 @@ static HookDef g_hooks[] = {
     { "P.MDBP",    "PlayerHitController", "MDBPFBOOPGP", 2,  0x1AA3E30, true,  (void*)h_MDBP,          false },
     { "P.HitVS",   "PlayerHitController", "HitViaServer", 5, 0x1AA2B84, false, (void*)h_HitViaServer,  false },
     { "P.Die",     "PlayerController",    "DieViaServer", 0,  0x1AAE87C, false, (void*)h_Die,           false },
+    { "GUN.Input", "GunController",       "DANAHKIIPHK", 3,  0x190E338, true,  (void*)h_GunInput,      false },
+    { "GUN.Tick",  "GunController",       "CCDAKKENGBH", 1,  0x1914044, true,  (void*)h_GunTick,       false },
+    { "GUN.V13",   "GunController",       "ELEOJFHKLDC", 0,  0x1911EB4, true,  (void*)h_GunV0,         false },
+    { "GUN.V11",   "GunController",       "LCIFHNLNDNE", 0,  0x1912FB0, true,  (void*)h_GunV0,         false },
 };
 static const int kHooks = sizeof(g_hooks) / sizeof(g_hooks[0]);
 static int g_attempt;
